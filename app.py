@@ -1,5 +1,5 @@
 import streamlit as st
-import sqlite3, os, io, html
+import sqlite3, os, io, html, hashlib, json
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from reportlab.lib.pagesizes import A4
@@ -23,7 +23,9 @@ def init_db():
     con = db(); cur = con.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), shop_name TEXT, address TEXT, gstin TEXT, phone TEXT, state TEXT, state_code TEXT, declaration TEXT, username TEXT, password TEXT)")
     cur.execute("CREATE TABLE IF NOT EXISTS customers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, phone TEXT, address TEXT, gstin TEXT, state TEXT, state_code TEXT)")
-    cur.execute("CREATE TABLE IF NOT EXISTS invoices (id INTEGER PRIMARY KEY AUTOINCREMENT, invoice_no TEXT UNIQUE, invoice_date TEXT, customer_name TEXT, customer_address TEXT, customer_gstin TEXT, customer_state TEXT, customer_state_code TEXT, taxable REAL, cgst REAL, sgst REAL, total REAL, items_json TEXT)")
+    cur.execute("CREATE TABLE IF NOT EXISTS invoices (id INTEGER PRIMARY KEY AUTOINCREMENT, invoice_no TEXT UNIQUE, invoice_date TEXT, customer_name TEXT, customer_address TEXT, customer_gstin TEXT, customer_state TEXT, customer_state_code TEXT, taxable REAL, cgst REAL, sgst REAL, igst REAL DEFAULT 0, total REAL, items_json TEXT)")
+    cols=[r[1] for r in cur.execute('PRAGMA table_info(invoices)').fetchall()]
+    if 'igst' not in cols: cur.execute('ALTER TABLE invoices ADD COLUMN igst REAL DEFAULT 0')
     if cur.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 0:
         cur.execute("INSERT INTO settings VALUES (1,?,?,?,?,?,?,?,?,?)", ("Agarwal Paint & Hardware Store", "Jattari, Aligarh, Uttar Pradesh", "", "", "Uttar Pradesh", "09", "Goods once sold will not be taken back unless agreed.", "admin", "admin123"))
     con.commit(); con.close()
@@ -73,10 +75,11 @@ def make_pdf(inv, items, s):
     data.append(["","","","","","Taxable",money(inv['taxable'])])
     data.append(["","","","","","CGST",money(inv['cgst'])])
     data.append(["","","","","","SGST",money(inv['sgst'])])
+    if float(inv.get('igst',0)): data.append(["","","","","","IGST",money(inv['igst'])])
     data.append(["","","","","","TOTAL",money(inv['total'])])
     tt=Table(data,colWidths=[30,180,60,40,65,55,80],repeatRows=1)
     tt.setStyle(TableStyle([('GRID',(0,0),(-1,-1),.45,colors.black),('BACKGROUND',(0,0),(-1,0),colors.lightgrey),('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),('FONTNAME',(-2,-4),(-1,-1),'Helvetica-Bold'),('ALIGN',(0,0),(-1,-1),'CENTER'),('ALIGN',(1,1),(1,-1),'LEFT'),('ALIGN',(-1,1),(-1,-1),'RIGHT'),('VALIGN',(0,0),(-1,-1),'MIDDLE'),('FONTSIZE',(0,0),(-1,-1),7.2),('LEFTPADDING',(0,0),(-1,-1),3),('RIGHTPADDING',(0,0),(-1,-1),3),('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),4)])); story += [tt,Spacer(1,6)]
-    story += [Paragraph(f"<b>Amount in Words:</b> Rupees {num_words(inv['total'])} Only",small), Paragraph(f"<b>Tax Amount in Words:</b> Rupees {num_words(inv['cgst']+inv['sgst'])} Only",small), Spacer(1,12)]
+    story += [Paragraph(f"<b>Amount in Words:</b> Rupees {num_words(inv['total'])} Only",small), Paragraph(f"<b>Tax Amount in Words:</b> Rupees {num_words(inv['cgst']+inv['sgst']+inv.get('igst',0))} Only",small), Spacer(1,12)]
     bottom=Table([[Paragraph(f"<b>Declaration</b><br/>{html.escape(s['declaration'])}",small),Paragraph("For <b>"+html.escape(s['shop_name'])+"</b><br/><br/><br/>Authorized Signatory",right)]],colWidths=[340,170]); bottom.setStyle(TableStyle([('BOX',(0,0),(-1,-1),.6,colors.black),('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),6),('TOPPADDING',(0,0),(-1,-1),6)])); story += [bottom,Spacer(1,5),Paragraph("This is a computer generated invoice",center)]
     doc.build(story); buf.seek(0); return buf.getvalue()
 
@@ -119,32 +122,36 @@ if page=="New Invoice":
     with cs1: cstate=st.text_input("State",value=cust['state'] if cust else "")
     with cs2: ccode=st.text_input("State Code",value=cust['state_code'] if cust else "")
     st.subheader("Items")
-    if 'items' not in st.session_state: st.session_state.items=[]
+    if 'items' not in st.session_state: st.session_state["items"]=[]
     with st.form("add_item",clear_on_submit=True):
         a,b,c,d,e,f=st.columns([3,1.2,1,1.3,1.2,1])
         desc=a.text_input("Description"); hsn=b.text_input("HSN/SAC"); qty=c.number_input("Qty",min_value=0.01,value=1.0); rate=d.number_input("Rate",min_value=0.0,value=0.0); disc=e.number_input("Disc %",min_value=0.0,max_value=100.0,value=0.0); gst=f.selectbox("GST %",[0,5,12,18,28])
         add=st.form_submit_button("+ Add Item")
         if add and desc:
             gross=qty*rate; amount=gross*(1-disc/100)
-            st.session_state.items.append({'description':desc,'hsn':hsn,'qty':qty,'rate':rate,'discount':disc,'gst':gst,'amount':amount})
+            st.session_state["items"].append({'description':desc,'hsn':hsn,'qty':qty,'rate':rate,'discount':disc,'gst':gst,'amount':amount})
             st.rerun()
-    if st.session_state.items:
-        for i,it in enumerate(st.session_state.items):
+    if st.session_state["items"]:
+        for i,it in enumerate(st.session_state["items"]):
             x=st.columns([4,1,1,1,1,1])
             x[0].write(it['description']); x[1].write(it['qty']); x[2].write(money(it['rate'])); x[3].write(f"{it['gst']}%"); x[4].write(money(it['amount']))
-            if x[5].button("Remove",key=f"rm{i}"): st.session_state.items.pop(i); st.rerun()
-        taxable=sum(x['amount'] for x in st.session_state.items); same_state=True
-        cgst=sum(x['amount']*x['gst']/200 for x in st.session_state.items); sgst=cgst; total=taxable+cgst+sgst
-        st.markdown(f"**Taxable:** {money(taxable)}  |  **CGST:** {money(cgst)}  |  **SGST:** {money(sgst)}  |  **TOTAL:** {money(total)}")
+            if x[5].button("Remove",key=f"rm{i}"): st.session_state["items"].pop(i); st.rerun()
+        taxable=sum(x['amount'] for x in st.session_state["items"])
+        same_state = bool(cstate.strip()) and cstate.strip().lower() == s['state'].strip().lower()
+        cgst=sum(x['amount']*x['gst']/200 for x in st.session_state["items"]) if same_state else 0
+        sgst=cgst
+        igst=sum(x['amount']*x['gst']/100 for x in st.session_state["items"]) if not same_state else 0
+        total=taxable+cgst+sgst+igst
+        st.markdown(f"**Taxable:** {money(taxable)}  |  **CGST:** {money(cgst)}  |  **SGST:** {money(sgst)}  |  **IGST:** {money(igst)}  |  **TOTAL:** {money(total)}")
         if st.button("Generate & Save Invoice",type="primary",use_container_width=True):
             con=db()
             try:
-                con.execute("INSERT INTO invoices(invoice_no,invoice_date,customer_name,customer_address,customer_gstin,customer_state,customer_state_code,taxable,cgst,sgst,total,items_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(inv_no,str(inv_date),cname,ca,cgstin,cstate,ccode,taxable,cgst,sgst,total,__import__('json').dumps(st.session_state.items)))
+                con.execute("INSERT INTO invoices(invoice_no,invoice_date,customer_name,customer_address,customer_gstin,customer_state,customer_state_code,taxable,cgst,sgst,igst,total,items_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(inv_no,str(inv_date),cname,ca,cgstin,cstate,ccode,taxable,cgst,sgst,igst,total,json.dumps(st.session_state["items"])))
                 con.commit(); st.success(f"Invoice {inv_no} saved.")
-                inv={'invoice_no':inv_no,'invoice_date':str(inv_date),'customer_name':cname,'customer_address':ca,'customer_gstin':cgstin,'customer_state':cstate,'customer_state_code':ccode,'taxable':taxable,'cgst':cgst,'sgst':sgst,'total':total}
-                pdf=make_pdf(inv,st.session_state.items,s)
+                inv={'invoice_no':inv_no,'invoice_date':str(inv_date),'customer_name':cname,'customer_address':ca,'customer_gstin':cgstin,'customer_state':cstate,'customer_state_code':ccode,'taxable':taxable,'cgst':cgst,'sgst':sgst,'igst':igst,'total':total}
+                pdf=make_pdf(inv,st.session_state["items"],s)
                 st.download_button("⬇️ Download PDF",pdf,file_name=f"{inv_no}.pdf",mime="application/pdf")
-                st.session_state.items=[]
+                st.session_state["items"]=[]
             except sqlite3.IntegrityError: st.error("Invoice number already exists.")
             finally: con.close()
 
